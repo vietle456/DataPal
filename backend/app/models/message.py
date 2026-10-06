@@ -13,9 +13,9 @@ if TYPE_CHECKING:
 class Message(Base):
     __tablename__ = "messages"
 
-    message_id: Mapped[str] = mapped_column(String, primary_key=True)
+    id: Mapped[str] = mapped_column(String, primary_key=True)
     conversation_id: Mapped[str] = mapped_column(
-        String, ForeignKey("conversations.conversation_id"), nullable=False
+        String, ForeignKey("conversations.id"), nullable=False
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(

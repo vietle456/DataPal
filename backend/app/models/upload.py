@@ -13,9 +13,9 @@ if TYPE_CHECKING:
 class Upload(Base):
     __tablename__ = "uploads"
 
-    upload_id: Mapped[str] = mapped_column(String, primary_key=True)
+    id: Mapped[str] = mapped_column(String, primary_key=True)
     conversation_id: Mapped[str] = mapped_column(
-        String, ForeignKey("conversations.conversation_id"), nullable=False
+        String, ForeignKey("conversations.id"), nullable=False
     )
     name: Mapped[str] = mapped_column(String, nullable=False)
     is_selected: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

@@ -26,7 +26,7 @@ class TokenResponse(BaseModel):
 
 
 class UserResponse(BaseModel):
-    user_id: str
+    user_id: str = Field(..., validation_alias="id")
     username: str
 
-    model_config = {"from_attributes": True}
+    model_config = {"from_attributes": True, "populate_by_name": True}

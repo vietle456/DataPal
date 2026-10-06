@@ -100,6 +100,70 @@ SELF-CHECK before creating a new step
   If 1 and 2 are YES and 3–7 are all NO → COMBINE into the current step.
 
 ───────────────────────────────────────────────
+ENTITY-LEVEL REASONING & ANALYTICAL GRAIN (CRITICAL)
+───────────────────────────────────────────────
+A tabular dataset row does NOT necessarily represent the logical entity being asked about.
+Before planning any analytical step:
+  1. Identify the Table Grain:
+     Inspect the schema, column names, and sample rows to deduce what one physical row represents.
+     Does one row represent:
+       - An individual transaction or event?
+       - An entity sub-record broken down by another dimension (e.g. product by store/region,
+         title/item by platform/version/channel, employee by month/department)?
+       - A unique, dedicated row per entity?
+  2. Identify the Target Entity & Analytical Grain:
+     Determine what logical entity the user is asking about (e.g. products, customers, transactions,
+     categories, regions, variants).
+  3. Determine the Appropriate Strategy:
+     • Entity-level ranking / aggregation (grain = "entity"):
+       Whenever the user asks for "top N [entities]" or "best-selling / highest / lowest [entities]"
+       (e.g. "top 3 products", "top 3 games/titles", "top 5 customers", "best-selling items"):
+       The target entity is the conceptual entity (identified by the entity column, e.g. Name, product_id, customer_id), NOT the individual table rows.
+       Even if the table has an existing Rank or ID column, individual rows in tabular data frequently represent breakdown records (e.g. per-platform, per-store, per-variant, per-channel, or per-period).
+       Therefore, for ANY question asking for top/best entities:
+         - grain MUST be "entity" (NEVER "row").
+         - entity_key = the entity column (e.g. Name, product_id, customer_id).
+         - grouping_columns = [entity_key].
+         - measures = [measure_column] (e.g. Global_Sales, revenue, amount).
+         - aggregation_function = "SUM" (for totals/sales/revenue/volumes) or "AVG".
+         - ranking_order = "DESC", limit = N.
+         - In the step description, you MUST explicitly specify: "Group by <entity_key>, calculate SUM(<measure>), order by total <measure> descending, and limit to N."
+         - NEVER instruct to filter and sort raw unaggregated rows with LIMIT N for entity ranking —
+           doing so ranks sub-records and causes duplicate entities with partial values.
+     • Row-level ranking / retrieval (grain = "row"):
+       Use grain = "row" ONLY when the user explicitly asks about individual records, transactions,
+       or single events (e.g. "top 3 transactions with highest amount", "largest individual store orders",
+       "5 highest single sales records").
+       In that case: do NOT group by. Set grain = "row", aggregation_function = "NONE", grouping_columns = [].
+       Sort raw rows directly by the column descending with LIMIT N.
+     • Grouped ranking / dimension breakdown (grain = "group"):
+       When the user asks about an attribute or dimension (e.g. "which regions generated the most
+       revenue", "total sales by department"):
+       Group by that dimension column and aggregate the measure (SUM/AVG).
+     • Entity counting vs. row counting:
+       When the question asks for "most [entities]" or count of entities (e.g. "which publisher released the most
+       titles/products?", "which categories have the most distinct items?"):
+       If an entity can appear across multiple rows within that group (e.g. sold or released across multiple
+       platforms, channels, or dates), counting entities requires COUNT(DISTINCT <entity_key>)
+       (aggregation_function = "COUNT_DISTINCT").
+       If each row represents an event or transaction instance being counted (e.g. "which customer
+       placed the most orders"), COUNT(*) or COUNT(<transaction_id>) is appropriate.
+     • Explicit granularity:
+       If the user asks for a specific sub-entity or variant level (e.g. "top 5 product variants
+       by sales", "top store-item combinations"), follow the requested granularity:
+       entity_key = "<variant_column>", rather than collapsing to the parent entity.
+
+───────────────────────────────────────────────
+CONVERSATIONAL CONTEXT & FOLLOW-UP QUESTIONS
+───────────────────────────────────────────────
+When the user question contains pronouns or contextual references ("their", "those", "that company",
+"during that same period", "the previous category", "those products"):
+  1. Resolve each reference from the prior conversation history into concrete values/identifiers.
+  2. Write the resolved, concrete filters (e.g. Publisher = 'Activision', Year BETWEEN 2005 AND 2010,
+     Category = 'Electronics') explicitly into every step description and semantic_intent.filters.
+  3. Never write vague phrases like "filter for their products" — always use the concrete resolved entities.
+
+───────────────────────────────────────────────
 TOOL-SELECTION RULES (CRITICAL — follow strictly)
 ───────────────────────────────────────────────
 - Use SQL_QUERY for ALL relational operations:
@@ -127,44 +191,68 @@ TOOL-SELECTION RULES (CRITICAL — follow strictly)
 EXAMPLES
 ───────────────────────────────────────────────
 
-Example 1 — aggregation + comparison in ONE SQL step:
-  User: "Which region (NA, EU, JP, Other) generates the most revenue overall?"
+Example 1 — Entity-level ranking on multi-row dataset in ONE SQL step:
+  User: "What are the top 3 products by total sales?"
+  Context: The dataset contains multiple rows per product across different stores and dates.
   Correct plan:
-    Step 1 [SQL_QUERY]: Calculate total revenue for each region (NA, EU, JP, Other) by summing
-                        the respective sales columns, returning ALL regions ordered by revenue DESC
-                        so the answer can include a full breakdown. Do NOT use LIMIT 1.
-    Step 2 [ANSWER]:    State which region has the highest revenue and provide the full breakdown
-                        of all regions for context.
-  Do NOT use LIMIT 1 on aggregation queries that answer comparative or ranking questions —
-  always return all groups so the final answer can provide complete context.
+    Step 1 [SQL_QUERY]: Aggregate total sales for each product by grouping by product_name and summing
+                        sales_amount, ordering by total sales DESC, and selecting the top 3.
+                        (semantic_intent: target_entity="product", entity_key="product_name",
+                         grain="entity", grouping_columns=["product_name"], measures=["sales_amount"],
+                         aggregation_function="SUM", ranking_order="DESC", limit=3)
+    Step 2 [ANSWER]:    Present the top 3 products and their total sales.
 
-Example 2 — SQL retrieves data, Python handles advanced statistics in ONE step:
-  User: "Load the sales data and compute the Pearson correlation between critic score and global sales."
+Example 2 — Grouped breakdown with entity counting:
+  User: "Which publisher released the most titles between 2005 and 2010?"
+  Context: The dataset contains multiple platform releases for each title.
   Correct plan:
-    Step 1 [SQL_QUERY]: Select critic_score and global_sales from the dataset, excluding rows where either column is NULL.
-    Step 2 [PYTHON]:    Compute the Pearson correlation coefficient between critic_score and global_sales using the query result.
-  Do NOT use Python to filter nulls, aggregate, or rank — those belong in SQL.
-  Do NOT use SQL for the correlation itself — it is an advanced statistic that requires Python (e.g. scipy / pandas).
+    Step 1 [SQL_QUERY]: Filter rows where Year BETWEEN 2005 AND 2010, group by publisher, and count
+                        distinct titles using COUNT(DISTINCT title_name). Return all publishers ordered
+                        by title count DESC. Do NOT use LIMIT 1.
+                        (semantic_intent: target_entity="title", entity_key="title_name",
+                         grain="group", grouping_columns=["publisher"], measures=["title_name"],
+                         aggregation_function="COUNT_DISTINCT", ranking_order="DESC", limit=null,
+                         filters="Year BETWEEN 2005 AND 2010")
+    Step 2 [ANSWER]:    Identify the publisher with the most titles and present the full breakdown.
 
-Example 3 — two steps because of a modality change (SQL → Python):
+Example 3 — Row-level ranking (transactions) without aggregation:
+  User: "What are the 5 transactions with the highest amount?"
+  Context: Question asks for individual transaction records.
+  Correct plan:
+    Step 1 [SQL_QUERY]: Select the 5 transaction records with the highest amount by ordering raw rows
+                        by amount DESC with LIMIT 5 without grouping.
+                        (semantic_intent: target_entity="transaction", entity_key=null,
+                         grain="row", grouping_columns=[], measures=["amount"],
+                         aggregation_function="NONE", ranking_order="DESC", limit=5)
+    Step 2 [ANSWER]:    List the 5 highest transactions.
+
+Example 4 — Modality change (SQL → Python):
   User: "Find monthly revenue and create a chart showing the trend."
   Correct plan:
     Step 1 [SQL_QUERY]: Aggregate total revenue by month.
     Step 2 [PYTHON]:    Create a line chart of monthly revenue using the query result.
-
-Example 4 — multiple steps because of runtime-dependent reasoning:
-  User: "Find the highest-revenue region. If it is NA, analyze sales by genre; otherwise analyze by platform."
-  Correct plan:
-    Step 1 [SQL_QUERY]: Calculate regional revenue and identify the highest-revenue region.
-    Step 2 [SQL_QUERY]: Perform the appropriate genre or platform breakdown based on the runtime result from step 1.
-    Step 3 [ANSWER]:    Summarize the findings.
+    Step 3 [ANSWER]:    Summarize the trend.
 
 Output schema:
 {
   "plan": {
     "intent": "<Direct answer | Code execution>",
     "steps": [
-      { "type": "<SQL_QUERY | PYTHON | ANSWER>", "description": "<what this step does>" }
+      {
+        "type": "<SQL_QUERY | PYTHON | ANSWER>",
+        "description": "<what this step does>",
+        "semantic_intent": {
+          "target_entity": "<e.g. product | title | transaction | region | customer>",
+          "entity_key": "<column name identifying entity, or null>",
+          "grain": "<entity | row | group>",
+          "grouping_columns": ["<column names to GROUP BY>"],
+          "measures": ["<measure column names>"],
+          "aggregation_function": "<SUM | AVG | COUNT | COUNT_DISTINCT | NONE>",
+          "ranking_order": "<DESC | ASC | null>",
+          "limit": <number or null>,
+          "filters": "<concrete filters resolved from context>"
+        }
+      }
     ]
   }
 }
@@ -174,9 +262,29 @@ Example output:
   "plan": {
     "intent": "Code execution",
     "steps": [
-      { "type": "SQL_QUERY", "description": "Calculate total revenue by region and identify the region with the highest revenue in one query using ORDER BY DESC LIMIT 1." },
-      { "type": "PYTHON",    "description": "Render a bar chart of revenue by region from the SQL result and annotate the top-performing region." },
-      { "type": "ANSWER",    "description": "Summarize which region had the highest revenue and by how much it exceeded the next closest region." }
+      {
+        "type": "SQL_QUERY",
+        "description": "Calculate total revenue by region and return all regions ordered by revenue DESC.",
+        "semantic_intent": {
+          "target_entity": "region",
+          "entity_key": "region",
+          "grain": "group",
+          "grouping_columns": ["region"],
+          "measures": ["revenue"],
+          "aggregation_function": "SUM",
+          "ranking_order": "DESC",
+          "limit": null,
+          "filters": null
+        }
+      },
+      {
+        "type": "PYTHON",
+        "description": "Render a bar chart of revenue by region from the SQL result."
+      },
+      {
+        "type": "ANSWER",
+        "description": "Summarize which region had the highest revenue and by how much it exceeded the next closest region."
+      }
     ]
   }
 }
@@ -191,7 +299,7 @@ Your job in this step is SQL CODE GENERATION ONLY.
 You will receive:
 - The user's original question
 - The database schema (table names, column types, sample rows)
-- A numbered analytical plan produced by the planner
+- A numbered analytical plan produced by the planner, including the step description and structured semantic intent
 
 Generate the SQL query for the CURRENT step indicated in the plan.
 
@@ -212,6 +320,34 @@ SQL rules:
   - SQL is the right tool for ALL data manipulation: filtering, selecting, grouping, aggregating,
     joining, sorting, window functions, and any built-in statistical functions the database
     supports (stddev, variance, percentile_cont, etc.).
+
+Analytical Grain & Entity Aggregation:
+  - Infer the grain of the table from the schema and sample rows, and follow the step's semantic intent:
+  - ENTITY-LEVEL RANKING (grain = "entity" or question asks for top N entities where multiple rows can represent the same entity):
+    • You MUST aggregate to the entity level: GROUP BY <entity_key>.
+    • Aggregate the measure: SUM(<measure>) AS total_<measure> (or AVG, etc.).
+    • Order by the aggregated measure: ORDER BY total_<measure> DESC.
+    • Apply LIMIT <limit> (e.g. LIMIT 3).
+    • CRITICAL: NEVER emit an unaggregated SELECT <entity>, <measure> FROM ... ORDER BY <measure> DESC LIMIT N.
+      Raw rows represent sub-records (e.g. per-platform, per-store, per-date entries); ranking raw rows returns
+      duplicate entities with partial numbers instead of the true top entities.
+  - ROW-LEVEL RANKING (grain = "row" or question explicitly asks for top transactions/events/individual records):
+    • Do NOT group by.
+    • Query raw rows directly: SELECT ... FROM ... ORDER BY <measure> DESC LIMIT <limit>.
+  - GROUPED RANKING (grain = "group"):
+    • GROUP BY <grouping_columns> and aggregate measures.
+    • Return all groups for context unless an explicit top-k limit is requested.
+  - ENTITY COUNTING:
+    • When counting entities per group (e.g. titles, products, items) and multiple rows can represent
+      the same entity under that group, use COUNT(DISTINCT <entity_key>) AS <alias>.
+    • Only use COUNT(*) when counting raw events or transactions where each row represents an instance.
+  - EXPLICIT GRANULARITY:
+    • If the question asks for a specific finer variant/level (e.g. product variants, store-item pairs),
+      group by that specific variant column.
+  - FILTERS:
+    • Apply all resolved filter conditions in the WHERE clause BEFORE grouping and aggregation.
+  - An explicit "top N" request may use LIMIT N after aggregation. The rule against LIMIT 1
+    applies to unqualified "which is the most/highest" questions.
 
 Output ONLY the raw SQL query — no markdown fences, no explanations, no comments outside the code.
 """.strip()
@@ -349,6 +485,12 @@ Rules:
     to improve readability for enterprise stakeholders.
   - Do not mention internal implementation details (SQL, Python, Docker, MCP, LangGraph).
   - Maintain a professional, analytical tone suitable for enterprise stakeholders.
+  - Entity-level awareness & duplicate safeguarding:
+    When answering a question about top N entities (e.g. top products, top games, top clients),
+    verify whether the entities presented are distinct. If the execution results contain duplicate
+    entries for the same entity name (indicating that individual sub-records, such as per-platform,
+    per-store, or per-variant records, were retrieved), explicitly note this distinction to the
+    user rather than describing duplicate rows as distinct top entities.
   - CRITICAL — No hallucination: If the guidance or execution output states that data is
     unavailable, the schema is missing, or the question cannot be answered, you MUST relay
     that honestly to the user. Do NOT invent data, table names, column names, category names,

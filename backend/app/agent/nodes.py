@@ -5,13 +5,14 @@ from pathlib import Path
 
 import duckdb
 import pandas as pd
+import sqlglot
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from sqlglot import expressions as exp
 
 from app.agent.state import AgentState
-from app.core.config import SQL_RESULTS_PATH
+from app.core.config import get_conversation_storage_paths
 from app.core.logging_config import get_logger
 from app.core.security_ast import validate_python, validate_sql
-from app.exceptions import SqlResultTooLargeError
 from app.prompt.prompt import (
     CODE_GEN_PYTHON_SYSTEM_PROMPT,
     CODE_GEN_SQL_SYSTEM_PROMPT,
@@ -19,9 +20,9 @@ from app.prompt.prompt import (
     FINAL_ANSWER_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
 )
-from app.schemas.artifact_schema import DatasetArtifact
 from app.schemas.execution_output import PythonExecutionResult, SQLExecutionResult
-from app.schemas.plan import Plan
+from app.schemas.intermediate_artifact import DatasetArtifact
+from app.schemas.plan import Plan, PlanStep
 
 logger = get_logger(__name__)
 
@@ -29,6 +30,7 @@ logger = get_logger(__name__)
 
 MAX_RETRIES = 3  # maximum code-correction attempts per step
 MCP_TOOL_TIMEOUT = 60  # seconds before an MCP tool call is considered hung
+RESULT_CHAR_BUDGET = 12000  # max chars (~3-4k tokens) of SQL result rows sent to the final answer
 
 
 class _Route:
@@ -63,9 +65,30 @@ class PlannerNode:
         question = state["messages"][-1].content
         logger.debug("[PlannerNode] START | question=%r", question)
 
-        if self._schema_tool:
-            logger.debug("[PlannerNode] Fetching DB schema via MCP tool")
-            schema_context = await self._schema_tool.ainvoke({})
+        # ── Schema: fingerprint caching via DuckDB file mtime (Strategy 1)
+        # Reuse cached value on follow-up turns if database file hasn't changed.
+        # Fetch fresh schema if an upload happened, database was updated, or on turn 1.
+        conversation_id = state["conversation_id"]
+        db_path = get_conversation_storage_paths(conversation_id)["db"]
+        current_version = db_path.stat().st_mtime if db_path.exists() else 0.0
+
+        cached_schema: str = state.get("schema_context") or ""
+        cached_version = state.get("schema_version")
+
+        if cached_schema and cached_version == current_version:
+            logger.debug(
+                "[PlannerNode] Schema cache HIT (version=%s) — reusing cached schema (%d chars)",
+                current_version,
+                len(cached_schema),
+            )
+            schema_context = cached_schema
+        elif self._schema_tool:
+            logger.debug(
+                "[PlannerNode] Schema cache MISS (old=%s, current=%s) — fetching fresh schema via MCP",
+                cached_version,
+                current_version,
+            )
+            schema_context = await self._schema_tool.ainvoke({"conversation_id": conversation_id})
             logger.debug("[PlannerNode] Schema fetched (%d chars)", len(schema_context))
         else:
             logger.warning("[PlannerNode] No schema tool found — proceeding without schema")
@@ -103,8 +126,28 @@ class PlannerNode:
 
         question_with_schema = f"User question: {state['messages'][-1].content}{schema_section}"
 
+        # ── Conversation history: inject the last N prior messages so the planner
+        # can handle follow-up questions (e.g. "now filter that by date").  We
+        # exclude the final message because it is already embedded in
+        # question_with_schema above.  Limit to MAX_HISTORY_MESSAGES to keep the
+        # context window bounded.
+        MAX_HISTORY_MESSAGES = 10
+        prior_messages = state["messages"][:-1]  # all turns except the current one
+        if len(prior_messages) > MAX_HISTORY_MESSAGES:
+            prior_messages = prior_messages[-MAX_HISTORY_MESSAGES:]
+            logger.debug(
+                "[PlannerNode] Conversation history trimmed to last %d messages",
+                MAX_HISTORY_MESSAGES,
+            )
+        else:
+            logger.debug(
+                "[PlannerNode] Injecting %d prior message(s) into planner context",
+                len(prior_messages),
+            )
+
         messages = [
             SystemMessage(content=PLANNER_SYSTEM_PROMPT),
+            *prior_messages,
             HumanMessage(content=question_with_schema),
         ]
 
@@ -145,10 +188,16 @@ class PlannerNode:
 
         return {
             "schema_context": schema_context,
+            "schema_version": current_version,
             "messages": [plan_response],
             "plan": plan,
             "current_step_index": 0,
             "retry_count": 0,
+            "generated_code": "",
+            "datasets": {},
+            "sql_execution_output": None,
+            "python_execution_output": None,
+            "execution_error": None,
         }
 
 
@@ -181,8 +230,6 @@ class CodeGenNode:
         prev_step_type = prev_step.type if prev_step else None
 
         if prev_step_type == "SQL_QUERY":
-            # DatasetArtifact holds the host storage_path and the container_path;
-            # columns/row_count come from sql_execution_output
             sql_output = state.get("sql_execution_output")
             datasets: dict = state.get("datasets") or {}
             # Use the most-recently added dataset artifact
@@ -228,8 +275,37 @@ Use `pd.read_parquet("{parquet_ref}")` to load this dataset.\
             prev_output_section = "No previous step output"
 
         steps_json = json.dumps([s.model_dump() for s in steps], indent=2)
+
+        semantic_section = ""
+        if current_step.semantic_intent:
+            si = current_step.semantic_intent
+            parts = []
+            if si.target_entity:
+                parts.append(f"Target entity: {si.target_entity}")
+            if si.entity_key:
+                parts.append(f"Entity key / identifier: {si.entity_key}")
+            if si.grain:
+                parts.append(f"Analytical grain: {si.grain}")
+            if si.grouping_columns:
+                parts.append(f"Grouping columns: {si.grouping_columns}")
+            if si.measures:
+                parts.append(f"Measures: {si.measures}")
+            if si.aggregation_function:
+                parts.append(f"Aggregation function: {si.aggregation_function}")
+            if si.ranking_order:
+                parts.append(f"Ranking order: {si.ranking_order}")
+            if si.limit is not None:
+                parts.append(f"Limit: {si.limit}")
+            if si.filters:
+                parts.append(f"Filters: {si.filters}")
+            if parts:
+                semantic_section = "\n  Semantic intent:\n    " + "\n    ".join(parts)
+
         context_message = HumanMessage(
             content=f"""
+User question:
+{state["current_question"]}
+
 Schema:
 {state["schema_context"]}
 
@@ -238,7 +314,7 @@ Full plan ({len(steps)} steps):
 
 Current step to implement (step {index + 1} of {len(steps)}):
   Type: {current_step.type}
-  Description: {current_step.description}
+  Description: {current_step.description}{semantic_section}
 
 {prev_output_section}
 """
@@ -309,7 +385,12 @@ class CodeExecNode:
             sql_tool = self._get_tool("execute_sql_query")
             logger.debug("[CodeExecNode] Invoking MCP tool 'execute_sql_query'")
             raw_result = await asyncio.wait_for(
-                sql_tool.ainvoke({"query": code}),
+                sql_tool.ainvoke(
+                    {
+                        "query": code,
+                        "conversation_id": state["conversation_id"],
+                    }
+                ),
                 timeout=MCP_TOOL_TIMEOUT,
             )
 
@@ -334,18 +415,14 @@ class CodeExecNode:
             if error_msg:
                 logger.debug("[CodeExecNode] SQL error:\n%s", error_msg)
 
-            # TODO
-            if row_count > 100:
-                raise SqlResultTooLargeError(row_count=row_count, limit=100)
-
             parquet_path: str | None = None
             result_id: str | None = None
             if success and rows:
                 try:
+                    sql_results_dir = Path(state["sql_results_dir"])
                     result_id = str(uuid.uuid4())
-                    SQL_RESULTS_PATH.mkdir(parents=True, exist_ok=True)
                     parquet_filename = f"result_{result_id}.parquet"
-                    parquet_path = str(SQL_RESULTS_PATH / parquet_filename)
+                    parquet_path = str(sql_results_dir / parquet_filename)
                     pd.DataFrame(rows).to_parquet(parquet_path, index=False)
                     logger.debug(
                         "[CodeExecNode] SQL result exported to parquet: %s",
@@ -388,6 +465,7 @@ class CodeExecNode:
                 parquet_filename = Path(dataset_artifact.storage_path).name
                 result["datasets"] = {
                     **(state.get("datasets") or {}),
+                    dataset_artifact.id: dataset_artifact,
                     parquet_filename: dataset_artifact,
                 }
 
@@ -399,7 +477,12 @@ class CodeExecNode:
             # Call the MCP tool — goes through the MCP protocol to the server process
             # which runs the code in Docker
             raw_result = await asyncio.wait_for(
-                python_tool.ainvoke({"code_str": code}),
+                python_tool.ainvoke(
+                    {
+                        "code_str": code,
+                        "conversation_id": state["conversation_id"],
+                    }
+                ),
                 timeout=MCP_TOOL_TIMEOUT,
             )
             # logger.debug("[CodeExecNode] Python raw result: %s", raw_result)
@@ -479,7 +562,7 @@ class ErrorCorrectionNode:
             HumanMessage(
                 content=f"""
 Original question:
-{state["messages"][0].content}
+{state["current_question"]}
 
 Schema:
 ```
@@ -552,7 +635,7 @@ class DirectAnswerNode:
             HumanMessage(
                 content=f"""
 User question:
-{state["messages"][0].content}
+{state["current_question"]}
 
 Guidance:
 {answer_step.description}
@@ -628,7 +711,7 @@ class FinalFormattingNode:
             HumanMessage(
                 content=f"""
 User question:
-{state["messages"][0].content}
+{state["current_question"]}
 {guidance_section}
 {execution_context_label}
 {execution_context}
@@ -653,10 +736,13 @@ User question:
 class SummarizeExecResult:
     """Prepares the SQL execution result for the final answer node.
 
-    - row_count <= 50 : serialises the full rows list as a JSON string.
-    - row_count >  50 : runs DuckDB SUMMARIZE on the parquet file and converts
-                        the statistical summary to a compact string so the LLM
-                        receives meaningful data without being flooded with rows.
+    Rows are serialised as compact CSV (cheaper than JSON, keys not repeated).
+
+    - Fits within RESULT_CHAR_BUDGET : the full result is passed as CSV.
+    - Exceeds the budget             : the first and last rows (as many as fit
+      in the budget) are passed as CSV, followed by a DuckDB SUMMARIZE of the
+      whole result, plus a note stating how many rows were shown. This keeps
+      entity/value pairs (e.g. top publisher + count) visible to the LLM.
     """
 
     def __call__(self, state: AgentState) -> dict:
@@ -667,63 +753,154 @@ class SummarizeExecResult:
             logger.warning("[SummarizeExecResult] Called with no sql_execution_output — skipping")
             return {}
 
-        row_count = sql_execution_output.row_count or 0
+        rows = sql_execution_output.rows or []
+        row_count = sql_execution_output.row_count or len(rows)
 
         logger.debug("[SummarizeExecResult] START | row_count=%d", row_count)
 
-        if row_count <= 50:
-            logger.debug(
-                "[SummarizeExecResult] Row count within threshold — passing full rows as JSON"
-            )
-            result = json.dumps(sql_execution_output.rows)
+        full_csv = pd.DataFrame(rows).to_csv(index=False)
+        dup_note = ""
+        if rows and len(rows) > 1:
+            for k in rows[0]:
+                vals = [r[k] for r in rows if r.get(k) is not None]
+                if vals and all(isinstance(v, str) for v in vals) and len(vals) != len(set(vals)):
+                    dup_names = [v for v in set(vals) if vals.count(v) > 1]
+                    dup_note = (
+                        f"\n[Note on Data Granularity: Column '{k}' contains repeated values ({dup_names}). "
+                        f"These represent individual sub-records/breakdowns for the same entity rather than distinct entities.]\n"
+                    )
+                    break
+
+        if len(full_csv) <= RESULT_CHAR_BUDGET:
+            logger.debug("[SummarizeExecResult] Result fits budget — passing full rows as CSV")
+            result = full_csv + dup_note
         else:
-            dataset = state["datasets"].get(sql_execution_output.id)
-            if dataset is None:
-                logger.warning(
-                    "[SummarizeExecResult] Dataset %r not found in state",
-                    sql_execution_output.id,
-                )
+            head_n, tail_n = self._select_head_tail(full_csv, len(rows))
+            header = full_csv.splitlines()[0]
+            lines = full_csv.splitlines()[1:]
+            head_lines = lines[:head_n]
+            tail_lines = lines[len(lines) - tail_n :] if tail_n else []
+            omitted = len(lines) - head_n - tail_n
 
-                sql_execution_output.summary = "No results"
-                return {"sql_execution_output": sql_execution_output}
-
-            parquet_path = dataset.storage_path
-            logger.debug(
-                "[SummarizeExecResult] Row count exceeds threshold — "
-                "running DuckDB SUMMARIZE on %s",
-                parquet_path,
-            )
-            try:
-                summary_rel = duckdb.sql(f"SUMMARIZE SELECT * FROM read_parquet('{parquet_path}');")
-                # Convert the DuckDBPyRelation to a human-readable string table
-                result = summary_rel.df().to_string(index=False)
-                logger.debug("[SummarizeExecResult] SUMMARIZE complete (%d chars)", len(result))
-            except (OSError, ValueError, AttributeError, duckdb.Error) as exc:
-                logger.warning(
-                    "[SummarizeExecResult] DuckDB SUMMARIZE failed (%s) — "
-                    "falling back to column metadata",
-                    exc,
-                )
-                col_names = [c.get("name", str(c)) for c in (sql_execution_output.columns or [])]
-                result = (
-                    f"SQL result too large to display in full "
-                    f"({row_count} rows). Columns: {col_names}"
-                )
+            parts = [
+                f"Result has {row_count} rows; showing the first {head_n} and last {tail_n} "
+                f"({omitted} omitted from the middle). Row order is as returned by the query.",
+                "FIRST ROWS (CSV):",
+                "\n".join([header, *head_lines]),
+            ]
+            if tail_lines:
+                parts += ["LAST ROWS (CSV):", "\n".join([header, *tail_lines])]
+            parts += [
+                "COLUMN STATISTICS OVER ALL ROWS (DuckDB SUMMARIZE):",
+                self._summarize(state, sql_execution_output, row_count),
+            ]
+            result = "\n".join(parts) + dup_note
 
         logger.debug("[SummarizeExecResult] final_execution_result set (%d chars)", len(result))
         sql_execution_output.summary = result
         return {"sql_execution_output": sql_execution_output}
 
+    @staticmethod
+    def _select_head_tail(full_csv: str, total_rows: int) -> tuple[int, int]:
+        """Pick how many head and tail rows fit in the budget (head gets 2/3)."""
+        lines = full_csv.splitlines()[1:]
+        head_budget = int(RESULT_CHAR_BUDGET * 2 / 3)
+        tail_budget = RESULT_CHAR_BUDGET - head_budget
+
+        head_n, used = 0, 0
+        for line in lines:
+            if used + len(line) + 1 > head_budget:
+                break
+            used += len(line) + 1
+            head_n += 1
+
+        tail_n, used = 0, 0
+        for line in reversed(lines[head_n:]):
+            if used + len(line) + 1 > tail_budget:
+                break
+            used += len(line) + 1
+            tail_n += 1
+        return max(head_n, 1) if total_rows else 0, tail_n
+
+    @staticmethod
+    def _summarize(state: AgentState, sql_execution_output, row_count: int) -> str:
+        dataset = state["datasets"].get(sql_execution_output.id)
+        if dataset is None:
+            logger.warning(
+                "[SummarizeExecResult] Dataset %r not found in state", sql_execution_output.id
+            )
+            return "(unavailable)"
+        try:
+            summary_rel = duckdb.sql(
+                f"SUMMARIZE SELECT * FROM read_parquet('{dataset.storage_path}');"
+            )
+            return summary_rel.df().to_string(index=False)
+        except (OSError, ValueError, AttributeError, duckdb.Error) as exc:
+            logger.warning("[SummarizeExecResult] DuckDB SUMMARIZE failed (%s)", exc)
+            col_names = [c.get("name", str(c)) for c in (sql_execution_output.columns or [])]
+            return f"(unavailable) {row_count} rows. Columns: {col_names}"
+
+
+def validate_semantic_sql(query: str, step: PlanStep) -> None:
+    """Lightweight semantic validation between plan and generated SQL.
+
+    Checks that if the step's semantic intent specifies entity-level aggregation or distinct
+    entity counting, the generated SQL contains the necessary GROUP BY and aggregation
+    clauses rather than ranking unaggregated physical rows.
+    """
+    if not step.semantic_intent:
+        return
+
+    si = step.semantic_intent
+    try:
+        tree = sqlglot.parse_one(query, dialect="duckdb")
+    except Exception:
+        return  # Syntax errors are caught by validate_sql
+
+    if not isinstance(tree, exp.Query):
+        return
+
+    has_group = tree.args.get("group") is not None
+    has_limit = tree.args.get("limit") is not None
+
+    # Check 1: Entity-level ranking without GROUP BY
+    is_entity_ranking = si.grain == "entity" or (
+        si.entity_key
+        and si.aggregation_function in ("SUM", "AVG", "COUNT", "COUNT_DISTINCT")
+        and (si.limit is not None or has_limit)
+    )
+    if is_entity_ranking and has_limit and not has_group:
+        entity_name = si.entity_key or si.target_entity or "entity"
+        agg_fn = si.aggregation_function if si.aggregation_function not in (None, "NONE") else "SUM"
+        raise ValueError(
+            f"Semantic Validation Error: Step requires entity-level ranking for '{entity_name}' with {agg_fn}() aggregation, "
+            f"but the generated query lacks a GROUP BY clause and ranks raw rows with LIMIT. "
+            f"Please aggregate using GROUP BY {entity_name} and {agg_fn}(<measure>) before applying ORDER BY and LIMIT."
+        )
+
+    # Check 2: Distinct entity counting
+    if si.aggregation_function == "COUNT_DISTINCT" and si.entity_key:
+        count_calls = list(tree.find_all(exp.Count))
+        if count_calls:
+            has_distinct_count = any(bool(c.find(exp.Distinct)) for c in count_calls)
+            if not has_distinct_count:
+                raise ValueError(
+                    f"Semantic Validation Error: Step requires counting distinct entities ('{si.entity_key}'), "
+                    f"but COUNT was used without DISTINCT. Use COUNT(DISTINCT {si.entity_key}) to avoid overcounting."
+                )
+
 
 def ast_eval_node(state: AgentState) -> dict:
     """Validates generated code safety before sandbox execution."""
     current_step_index = state["current_step_index"]
-    code_type = state["plan"].steps[current_step_index].type
+    current_step = state["plan"].steps[current_step_index]
+    code_type = current_step.type
 
     logger.debug("[ast_eval_node] Validating generated code with AST security checker")
     try:
         if code_type == "SQL_QUERY":
             validate_sql(state["generated_code"])
+            validate_semantic_sql(state["generated_code"], current_step)
         elif code_type == "PYTHON":
             validate_python(state["generated_code"])
         else:

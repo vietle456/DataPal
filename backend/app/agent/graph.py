@@ -1,10 +1,11 @@
+import contextlib
+import json
+from collections.abc import AsyncGenerator
+
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
-from langchain_mcp_adapters.tools import load_mcp_tools
-from langchain_openai import ChatOpenAI
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
-from mcp import ClientSession
-from mcp.client.stdio import stdio_client
 
 from app.agent.nodes import (
     CodeExecNode,
@@ -24,7 +25,7 @@ from app.agent.nodes import (
     step_router,
 )
 from app.agent.state import AgentState
-from app.core.config import MCP_SERVER_PARAMS
+from app.core import agent_checkpoint
 from app.core.logging_config import get_logger
 from app.schemas.plan import Plan
 
@@ -33,63 +34,213 @@ load_dotenv()
 logger = get_logger(__name__)
 
 
-async def run_graph(question: str) -> dict:
+async def run_graph(question: str, conversation_id: str) -> dict:
     """
-    Starts the MCP server subprocess, loads its tools, then assembles and invokes
-    the LangGraph state machine — all within the MCP session context so tools
-    remain valid throughout execution.
+    Invoke the pre-compiled LangGraph state machine and return the final state.
+
+    The MCP subprocess and compiled graph are long-lived (initialised at app
+    startup by ``init_agent``); this function simply submits work to them.
     """
-    logger.debug("[run_graph] Starting MCP stdio client subprocess")
-    async with (
-        stdio_client(MCP_SERVER_PARAMS) as (read, write),
-        ClientSession(read, write) as session,
-    ):
-        logger.debug("[run_graph] MCP session opened — initializing")
-        await session.initialize()
-        logger.debug("[run_graph] MCP session initialized")
+    from app.core.agent_runtime import compiled_graph  # noqa: PLC0415
+    from app.core.config import get_conversation_storage_paths  # noqa: PLC0415
 
-        # Convert MCP tools → LangChain Tool objects
-        mcp_tools = await load_mcp_tools(session)
-        logger.debug(
-            "[run_graph] Loaded %d MCP tools: %s",
-            len(mcp_tools),
-            [getattr(t, "name", str(t)) for t in mcp_tools],
-        )
+    if compiled_graph is None:
+        raise RuntimeError("Agent runtime is not initialised. Call init_agent() at startup.")
 
-        llm = ChatOpenAI(model="gpt-4o", temperature=0)
-        logger.debug("[run_graph] LLM initialized (model=gpt-4o)")
+    paths = get_conversation_storage_paths(conversation_id)
+    sql_results_dir = paths["sql_results"]
+    sql_results_dir.mkdir(parents=True, exist_ok=True)
 
-        graph = _build_state_graph(llm, mcp_tools)
-        logger.debug("[run_graph] State graph compiled")
+    # Clean out any leftover intermediate files from a previous run
+    for item in sql_results_dir.glob("*"):
+        if item.is_file():
+            with contextlib.suppress(OSError):
+                item.unlink()
 
-        initial_state: AgentState = {
-            "messages": [HumanMessage(content=question)],
-            "plan": Plan(intent="Code execution", steps=[]),
-            "current_step_index": 0,
-            "schema_context": "",
-            "generated_code": "",
-            "retry_count": 0,
-            "ast_violation": False,
-            "final_answer": "",
-            "datasets": {},
-            "sql_execution_output": None,
-            "python_execution_output": None,
-            "execution_error": None,
-        }
+    logger.debug("[run_graph] Using intermediate sql_results dir: %s", sql_results_dir)
+    initial_state: dict = {
+        "conversation_id": conversation_id,
+        "messages": [HumanMessage(content=question)],
+        "current_question": question,
+        "plan": Plan(intent="Code execution", steps=[]),
+        "current_step_index": 0,
+        "generated_code": "",
+        "retry_count": 0,
+        "ast_violation": False,
+        "final_answer": "",
+        "datasets": {},
+        "sql_execution_output": None,
+        "python_execution_output": None,
+        "execution_error": None,
+        "sql_results_dir": str(sql_results_dir),
+        # schema_context is intentionally omitted: LangGraph will keep the
+        # checkpointed value from the previous turn so PlannerNode can reuse
+        # it without a redundant MCP call.  On the very first turn the
+        # checkpoint has no value and state.get("schema_context") returns
+        # None / "", triggering a fresh fetch.
+    }
 
-        logger.debug("[run_graph] Invoking graph | question=%r", question)
-        result = await graph.ainvoke(initial_state)
+    config: RunnableConfig = {"configurable": {"thread_id": conversation_id}}
+    logger.debug("[run_graph] Invoking graph | question=%r", question)
+    try:
+        result = await compiled_graph.ainvoke(initial_state, config=config)
+    finally:
+        # Wipe intermediate files so they only live during a single user question
+        for item in sql_results_dir.glob("*"):
+            if item.is_file():
+                with contextlib.suppress(OSError):
+                    item.unlink()
+        # Reset intermediate datasets in checkpointer state for next turn
+        try:
+            await compiled_graph.aupdate_state(
+                config,
+                {
+                    "datasets": {},
+                    "sql_execution_output": None,
+                    "python_execution_output": None,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[run_graph] Failed to reset checkpointed state: %s", exc)
 
-        final_answer = result.get("final_answer", "")
-        logger.debug(
-            "[run_graph] Graph execution complete | final_answer_len=%d",
-            len(final_answer),
-        )
-        return result
+    logger.debug(
+        "[run_graph] Graph execution complete — intermediate dir cleaned up | final_answer_len=%d",
+        len(result.get("final_answer", "")),
+    )
+    return result
 
 
-def _build_state_graph(llm, mcp_tools):
-    logger.debug("[_build_state_graph] Building state graph")
+# ---------------------------------------------------------------------------
+# Node-label → human-readable status for SSE progress events
+# ---------------------------------------------------------------------------
+
+_NODE_LABELS: dict[str, str] = {
+    "planner": "Planning analysis steps…",
+    "direct_answer": "Generating direct answer…",
+    "code_generation": "Generating code…",
+    "ast_evaluation": "Checking code safety…",
+    "code_execution": "Executing code…",
+    "summarize_execution_result": "Summarising results…",
+    "error_correction": "Correcting error…",
+    "advance_step": "Advancing to next step…",
+    "final_formatting": "Formatting final answer…",
+    "fallback_failure": "Handling failure…",
+}
+
+
+async def stream_graph(question: str, conversation_id: str) -> AsyncGenerator[str, None]:
+    """
+    Async generator that streams SSE-formatted lines while the agent runs.
+
+    Yields lines in the format::
+
+        data: {"type": "progress", "node": "planner", "label": "Planning…"}\\n\\n
+        data: {"type": "token",    "content": "…chunk…"}\\n\\n
+        data: {"type": "done",     "content": "<full answer>"}\\n\\n
+
+    The caller is responsible for wrapping these in a FastAPI ``StreamingResponse``
+    with ``media_type="text/event-stream"``.
+    """
+    from app.core.agent_runtime import compiled_graph  # noqa: PLC0415
+    from app.core.config import get_conversation_storage_paths  # noqa: PLC0415
+
+    if compiled_graph is None:
+        raise RuntimeError("Agent runtime is not initialised. Call init_agent() at startup.")
+
+    paths = get_conversation_storage_paths(conversation_id)
+    sql_results_dir = paths["sql_results"]
+    sql_results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clean out any leftover intermediate files from a previous run
+    for item in sql_results_dir.glob("*"):
+        if item.is_file():
+            with contextlib.suppress(OSError):
+                item.unlink()
+
+    logger.debug("[stream_graph] Using intermediate sql_results dir: %s", sql_results_dir)
+    initial_state: dict = {
+        "conversation_id": conversation_id,
+        "messages": [HumanMessage(content=question)],
+        "current_question": question,
+        "plan": Plan(intent="Code execution", steps=[]),
+        "current_step_index": 0,
+        "generated_code": "",
+        "retry_count": 0,
+        "ast_violation": False,
+        "final_answer": "",
+        "datasets": {},
+        "sql_execution_output": None,
+        "python_execution_output": None,
+        "execution_error": None,
+        "sql_results_dir": str(sql_results_dir),
+        # schema_context is intentionally omitted: LangGraph will keep the
+        # checkpointed value from the previous turn so PlannerNode can reuse
+        # it without a redundant MCP call.  On the very first turn the
+        # checkpoint has no value and state.get("schema_context") returns
+        # None / "", triggering a fresh fetch.
+    }
+
+    final_answer = ""
+    config: RunnableConfig = {"configurable": {"thread_id": conversation_id}}
+
+    try:
+        async for event in compiled_graph.astream_events(
+            initial_state, config=config, version="v2"
+        ):
+            kind = event.get("event", "")
+            name = event.get("name", "")
+
+            # ── Node started → emit a progress tick ───────────────────────
+            if kind == "on_chain_start" and name in _NODE_LABELS:
+                payload = json.dumps(
+                    {"type": "progress", "node": name, "label": _NODE_LABELS[name]}
+                )
+                yield f"data: {payload}\n\n"
+
+            # ── LLM token delta → stream the text to the client ──────────
+            elif kind == "on_chat_model_stream":
+                chunk = event.get("data", {}).get("chunk")
+                token = ""
+                if chunk is not None:
+                    token = chunk.content if hasattr(chunk, "content") else str(chunk)
+                if token:
+                    payload = json.dumps({"type": "token", "content": token})
+                    yield f"data: {payload}\n\n"
+
+            # ── Graph finished → capture the final answer ─────────────────
+            elif kind == "on_chain_end" and name == "LangGraph":
+                output = event.get("data", {}).get("output", {})
+                final_answer = output.get("final_answer", "")
+    finally:
+        # Wipe intermediate files so they only live during a single user question
+        for item in sql_results_dir.glob("*"):
+            if item.is_file():
+                with contextlib.suppress(OSError):
+                    item.unlink()
+        # Reset intermediate datasets in checkpointer state for next turn
+        try:
+            await compiled_graph.aupdate_state(
+                config,
+                {
+                    "datasets": {},
+                    "sql_execution_output": None,
+                    "python_execution_output": None,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[stream_graph] Failed to reset checkpointed state: %s", exc)
+
+    # ── Sentinel: done ────────────────────────────────────────────────
+    payload = json.dumps({"type": "done", "content": final_answer})
+    yield f"data: {payload}\n\n"
+    logger.debug(
+        "[stream_graph] Stream complete — intermediate dir cleaned up | answer_len=%d",
+        len(final_answer),
+    )
+
+
+def build_state_graph(llm, mcp_tools):
+    logger.debug("[build_state_graph] Building state graph")
     graph = StateGraph(AgentState)  # type: ignore
 
     # ── Nodes ─────────────────────────────────────────────────────────────────
@@ -171,6 +322,6 @@ def _build_state_graph(llm, mcp_tools):
     graph.add_edge("fallback_failure", END)
     graph.add_edge("final_formatting", END)
 
-    compiled = graph.compile()
+    compiled = graph.compile(checkpointer=agent_checkpoint.checkpointer)
     logger.debug("[_build_state_graph] Graph compiled with %d nodes", 11)
     return compiled

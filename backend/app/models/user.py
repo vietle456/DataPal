@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 class User(Base):
     __tablename__ = "users"
 
-    user_id: Mapped[str] = mapped_column(String, primary_key=True)
+    id: Mapped[str] = mapped_column(String, primary_key=True)
     username: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     password: Mapped[str] = mapped_column(String, nullable=False)
 

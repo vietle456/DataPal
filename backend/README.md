@@ -1,6 +1,6 @@
-# DataAgent Backend
+# DataPal Backend
 
-The backend for **DataAgent-MCP**, built with **FastAPI**, **LangGraph**, **DuckDB**, and **Pandas**, featuring AST-based security guardrails for safe dynamic python execution.
+The backend for **DataPal**, built with **FastAPI**, **LangGraph**, **DuckDB**, and **Pandas**, featuring AST-based security guardrails for safe dynamic python execution.
 
 ---
 

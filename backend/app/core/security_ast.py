@@ -20,7 +20,19 @@ FORBIDDEN_PYTHON_MODULES = {
     "platform",
 }
 
-FORBIDDEN_PYTHON_FUNCTIONS = {"eval", "exec", "open"}
+FORBIDDEN_PYTHON_FUNCTIONS = {
+    "eval",
+    "exec",
+    "open",
+    "__import__",
+    "getattr",
+    "setattr",
+    "delattr",
+    "compile",
+    "globals",
+    "locals",
+    "vars",
+}
 
 FORBIDDEN_SQL_QUERY = {
     exp.Insert,
@@ -60,6 +72,11 @@ class SecurityVisitor(ast.NodeVisitor):
             if full_name in FORBIDDEN_PYTHON_FUNCTIONS:
                 raise ValueError(f"Forbidden function call: {full_name}")
 
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute):
+        if isinstance(node.attr, str) and node.attr.startswith("__"):
+            raise ValueError(f"Forbidden attribute access: {node.attr}")
         self.generic_visit(node)
 
 

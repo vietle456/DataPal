@@ -1,40 +1,51 @@
+import sys
 from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
 
-from app.agent.graph import run_graph
+from app.api.v1.artifact import router as artifact_router
 from app.api.v1.authentication import router as auth_router
-from app.api.v1.chat import router as chat_router
+from app.api.v1.conversation import router as conversation_router
+from app.api.v1.message import router as message_router
+from app.api.v1.upload import router as upload_router
+from app.core.agent_checkpoint import close_checkpointer, init_checkpointer
+from app.core.agent_runtime import close_agent, init_agent
 from app.core.database import create_tables
-from app.schemas.request import QuestionRequest
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Ensure all DB tables exist before the first request is served."""
+    """Start background services, create DB tables, then serve requests."""
     await create_tables()
-    yield
+    await init_checkpointer()
+    await init_agent()
+    try:
+        yield
+    finally:
+        await close_agent()
+        await close_checkpointer()
 
 
-app = FastAPI(lifespan=lifespan, title="Data Agent MCP", version="1.0.0")
+app = FastAPI(
+    lifespan=lifespan,
+    title="DataPal Backend",
+    version="1.0.0",
+    description="REST API for the DataPal data-agent platform.",
+)
 
-# Register routers
-app.include_router(auth_router, prefix="/api/v1")
-app.include_router(chat_router, prefix="/api/v1")
+API_PREFIX = "/api/v1"
 
+# Authentication
+app.include_router(auth_router, prefix=API_PREFIX)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await create_tables()
-    yield
-
-
-@app.post("/ask")
-async def ask(request: QuestionRequest):
-    result = await run_graph(request.question)
-    return {"answer": result["final_answer"]}
+# Conversations & nested resources
+app.include_router(conversation_router, prefix=API_PREFIX)
+app.include_router(message_router, prefix=API_PREFIX)
+app.include_router(upload_router, prefix=API_PREFIX)
+app.include_router(artifact_router, prefix=API_PREFIX)
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="localhost", port=8000)
+    loop_setup = "asyncio:SelectorEventLoop" if sys.platform == "win32" else "auto"
+    uvicorn.run(app, host="localhost", port=8000, loop=loop_setup)

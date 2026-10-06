@@ -14,12 +14,12 @@ if TYPE_CHECKING:
 class Artifact(Base):
     __tablename__ = "artifacts"
 
-    artifact_id: Mapped[str] = mapped_column(String, primary_key=True)
+    id: Mapped[str] = mapped_column(String, primary_key=True)
     conversation_id: Mapped[str | None] = mapped_column(
-        String, ForeignKey("conversations.conversation_id"), nullable=True
+        String, ForeignKey("conversations.id"), nullable=True
     )
     source_upload_id: Mapped[str | None] = mapped_column(
-        String, ForeignKey("uploads.upload_id"), nullable=True
+        String, ForeignKey("uploads.id"), nullable=True
     )
     name: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[datetime] = mapped_column(

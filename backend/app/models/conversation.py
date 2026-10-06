@@ -8,7 +8,6 @@ from app.models.base import Base
 
 if TYPE_CHECKING:
     from app.models.artifact import Artifact
-    from app.models.conversation_state import ConversationState
     from app.models.message import Message
     from app.models.upload import Upload
     from app.models.user import User
@@ -17,11 +16,11 @@ if TYPE_CHECKING:
 class Conversation(Base):
     __tablename__ = "conversations"
 
-    conversation_id: Mapped[str] = mapped_column(String, primary_key=True)
-    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.user_id"), nullable=False)
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
     last_message_id: Mapped[str | None] = mapped_column(
         String,
-        ForeignKey("messages.message_id", use_alter=True, name="fk_conversation_last_message"),
+        ForeignKey("messages.id", use_alter=True, name="fk_conversation_last_message"),
         nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
@@ -41,12 +40,6 @@ class Conversation(Base):
         "Message",
         back_populates="conversation",
         foreign_keys="Message.conversation_id",
-        cascade="all, delete-orphan",
-    )
-    conversation_state: Mapped[Optional["ConversationState"]] = relationship(
-        "ConversationState",
-        back_populates="conversation",
-        uselist=False,
         cascade="all, delete-orphan",
     )
     uploads: Mapped[list["Upload"]] = relationship(

@@ -42,7 +42,7 @@ async def register(
         )
 
     new_user = User(
-        user_id=str(uuid.uuid4()),
+        id=str(uuid.uuid4()),
         username=body.username,
         password=hash_password(body.password),
     )
@@ -90,5 +90,5 @@ async def login(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    access_token = create_access_token(subject=user.user_id)
+    access_token = create_access_token(subject=user.id)
     return TokenResponse(access_token=access_token)

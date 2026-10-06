@@ -1,4 +1,6 @@
+import contextlib
 import json
+import re
 from pathlib import Path
 
 import duckdb
@@ -9,19 +11,33 @@ from sqlglot import expressions as exp
 class DuckDBEngine:
     """Service wrapper for DuckDB analytical database operations."""
 
-    def __init__(self, db_path: str | Path | None = None):
+    def __init__(self, db_path: str | Path | None = None, read_only: bool = False):
         # In-memory database or disk-persisted .duckdb file
-        self.db_path = db_path or ":memory:"
-        self.conn = duckdb.connect(database=self.db_path)
+        self.db_path = str(db_path) if db_path else ":memory:"
+        self.conn = duckdb.connect(database=self.db_path, read_only=read_only)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        with contextlib.suppress(Exception):
+            self.conn.close()
 
     def load_dataset(self, file_path: Path, table_name: str) -> bool:
         """Dynamically ingests CSV or Parquet into DuckDB table."""
+        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", table_name):
+            raise ValueError(
+                f"Invalid table name '{table_name}': only letters, digits, "
+                "and underscores are allowed, and it must start with a letter or underscore."
+            )
+
+        escaped_path = str(file_path.resolve()).replace("'", "''")
+
         suffix = file_path.suffix.lower()
         if suffix == ".csv":
-            # Map common null-sentinel strings to SQL NULL so DuckDB can infer
-            # correct column types (e.g. BIGINT instead of VARCHAR).
-            # This covers the most common representations across real-world CSVs
-            # and is dataset-agnostic — no per-file configuration needed.
             _NULL_STRINGS = [
                 "N/A",
                 "n/a",
@@ -40,9 +56,9 @@ class DuckDBEngine:
                 "?",
             ]
             null_list = "[" + ", ".join(f"'{s}'" for s in _NULL_STRINGS) + "]"
-            query = f"CREATE TABLE '{table_name}' AS SELECT * FROM read_csv('{file_path}', nullstr={null_list});"
+            query = f"CREATE OR REPLACE TABLE \"{table_name}\" AS SELECT * FROM read_csv('{escaped_path}', nullstr={null_list});"
         elif suffix == ".parquet":
-            query = f"CREATE TABLE '{table_name}' AS SELECT * FROM read_parquet('{file_path}');"
+            query = f"CREATE OR REPLACE TABLE \"{table_name}\" AS SELECT * FROM read_parquet('{escaped_path}');"
         else:
             raise ValueError(f"Unsupported file format: {suffix}")
 
@@ -55,12 +71,12 @@ class DuckDBEngine:
         schema_info = {}
 
         for (table_name,) in tables:
-            # Get column names and types
-            col_info = self.conn.execute(f"DESCRIBE {table_name};").fetchall()
+            escaped_table = table_name.replace('"', '""')
+            col_info = self.conn.execute(f"DESCRIBE {escaped_table};").fetchall()
             columns = [{"name": c[0], "type": c[1]} for c in col_info]
 
             # Fetch sample rows
-            rows = self.conn.execute(f"SELECT * FROM {table_name} LIMIT 3").fetchall()
+            rows = self.conn.execute(f"SELECT * FROM {escaped_table} LIMIT 3").fetchall()
             samples = [dict(zip([c[0] for c in col_info], row, strict=False)) for row in rows]
 
             schema_info[table_name] = {"columns": columns, "sample_rows": samples}
@@ -111,6 +127,3 @@ class DuckDBEngine:
             }
         except (sqlglot.errors.SqlglotError, TypeError, duckdb.Error) as e:
             return {"success": False, "error": str(e)}
-
-    def close(self):
-        self.conn.close()
