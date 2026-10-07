@@ -162,3 +162,23 @@ async def test_delete_conversation_forbidden(client: AsyncClient, db_session):
     conv = await create_conversation(db_session, owner.id)
     resp = await client.delete(f"{BASE}/{conv.id}", headers=auth_headers(intruder.id))
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_delete_conversation_removes_storage_folder(client: AsyncClient, db_session):
+    from app.core.config import STORAGE_ROOT
+
+    user = await create_user(db_session, username="delconvstorage")
+    conv = await create_conversation(db_session, user.id)
+
+    conv_dir = STORAGE_ROOT / conv.id
+    conv_dir.mkdir(parents=True, exist_ok=True)
+    sample_file = conv_dir / "sample.txt"
+    sample_file.write_text("test data")
+
+    assert conv_dir.exists()
+
+    resp = await client.delete(f"{BASE}/{conv.id}", headers=auth_headers(user.id))
+    assert resp.status_code == 204
+    assert not conv_dir.exists()
+

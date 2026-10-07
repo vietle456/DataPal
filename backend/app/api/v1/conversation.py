@@ -1,3 +1,4 @@
+import shutil
 import uuid
 from typing import Annotated
 
@@ -5,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import STORAGE_ROOT
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.models.conversation import Conversation
@@ -125,6 +127,11 @@ async def delete_conversation(
     conversation = await _get_owned_conversation(conversation_id, current_user, db)
     await db.delete(conversation)
     await db.commit()
+
+    # Remove the conversation's local storage folder if it exists
+    conv_storage_dir = STORAGE_ROOT / conversation_id
+    if conv_storage_dir.exists():
+        shutil.rmtree(conv_storage_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
