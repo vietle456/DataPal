@@ -1,4 +1,4 @@
-"""Tests for GET/POST/PATCH/DELETE /api/v1/conversations/{id}/messages.
+"""Tests for GET/POST /api/v1/conversations/{id}/messages.
 
 Note: POST (create_message) with role='user' triggers the AI agent via SSE.
       We mock `stream_graph` to avoid real LLM calls.
@@ -57,28 +57,6 @@ async def test_list_messages_forbidden(client: AsyncClient, db_session):
     assert resp.status_code == 403
 
 
-# ---------------------------------------------------------------------------
-# GET /conversations/{id}/messages/{message_id}
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_get_message_success(client: AsyncClient, db_session):
-    user = await create_user(db_session, username="getmsg1")
-    conv = await create_conversation(db_session, user.id)
-    msg = await create_message(db_session, conv.id, content="Find me")
-
-    resp = await client.get(f"{BASE}/{conv.id}/messages/{msg.id}", headers=auth_headers(user.id))
-    assert resp.status_code == 200
-    assert resp.json()["content"] == "Find me"
-
-
-@pytest.mark.asyncio
-async def test_get_message_not_found(client: AsyncClient, db_session):
-    user = await create_user(db_session, username="getmsg2")
-    conv = await create_conversation(db_session, user.id)
-    resp = await client.get(f"{BASE}/{conv.id}/messages/no-such-msg", headers=auth_headers(user.id))
-    assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -223,67 +201,4 @@ async def test_create_message_forbidden(client: AsyncClient, db_session):
     assert resp.status_code == 403
 
 
-# ---------------------------------------------------------------------------
-# PATCH /conversations/{id}/messages/{message_id}
-# ---------------------------------------------------------------------------
 
-
-@pytest.mark.asyncio
-async def test_update_message_success(client: AsyncClient, db_session):
-    user = await create_user(db_session, username="updatemsg1")
-    conv = await create_conversation(db_session, user.id)
-    msg = await create_message(db_session, conv.id, content="Old content")
-
-    resp = await client.patch(
-        f"{BASE}/{conv.id}/messages/{msg.id}",
-        json={"content": "Updated content"},
-        headers=auth_headers(user.id),
-    )
-    assert resp.status_code == 200
-    assert resp.json()["content"] == "Updated content"
-
-
-@pytest.mark.asyncio
-async def test_update_message_not_found(client: AsyncClient, db_session):
-    user = await create_user(db_session, username="updatemsg2")
-    conv = await create_conversation(db_session, user.id)
-    resp = await client.patch(
-        f"{BASE}/{conv.id}/messages/ghost",
-        json={"content": "nope"},
-        headers=auth_headers(user.id),
-    )
-    assert resp.status_code == 404
-
-
-# ---------------------------------------------------------------------------
-# DELETE /conversations/{id}/messages/{message_id}
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_delete_message_success(client: AsyncClient, db_session):
-    user = await create_user(db_session, username="delmsg1")
-    conv = await create_conversation(db_session, user.id)
-    msg = await create_message(db_session, conv.id)
-    resp = await client.delete(f"{BASE}/{conv.id}/messages/{msg.id}", headers=auth_headers(user.id))
-    assert resp.status_code == 204
-
-
-@pytest.mark.asyncio
-async def test_delete_message_not_found(client: AsyncClient, db_session):
-    user = await create_user(db_session, username="delmsg2")
-    conv = await create_conversation(db_session, user.id)
-    resp = await client.delete(f"{BASE}/{conv.id}/messages/no-such", headers=auth_headers(user.id))
-    assert resp.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_delete_message_forbidden(client: AsyncClient, db_session):
-    owner = await create_user(db_session, username="msgowner3")
-    intruder = await create_user(db_session, username="msgintruder3")
-    conv = await create_conversation(db_session, owner.id)
-    msg = await create_message(db_session, conv.id)
-    resp = await client.delete(
-        f"{BASE}/{conv.id}/messages/{msg.id}", headers=auth_headers(intruder.id)
-    )
-    assert resp.status_code == 403

@@ -13,7 +13,7 @@ from app.core.deps import get_current_user
 from app.models.conversation import Conversation
 from app.models.message import Message
 from app.models.user import User
-from app.schemas.message import MessageCreate, MessageResponse, MessageUpdate
+from app.schemas.message import MessageCreate, MessageResponse
 
 router = APIRouter(prefix="/conversations", tags=["Messages"])
 
@@ -54,27 +54,6 @@ async def list_messages(
         .order_by(Message.created_at.asc())
     )
     return [MessageResponse.model_validate(m) for m in result.all()]
-
-
-# ---------------------------------------------------------------------------
-# GET /conversations/{conversation_id}/messages/{message_id}
-# ---------------------------------------------------------------------------
-
-
-@router.get(
-    "/{conversation_id}/messages/{message_id}",
-    response_model=MessageResponse,
-    summary="Get a single message",
-)
-async def get_message(
-    conversation_id: str,
-    message_id: str,
-    current_user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> MessageResponse:
-    await _assert_conversation_owned(conversation_id, current_user, db)
-    message = await _get_message(message_id, conversation_id, db)
-    return MessageResponse.model_validate(message)
 
 
 # ---------------------------------------------------------------------------
@@ -152,53 +131,6 @@ async def create_message(
 
 
 # ---------------------------------------------------------------------------
-# PATCH /conversations/{conversation_id}/messages/{message_id}
-# ---------------------------------------------------------------------------
-
-
-@router.patch(
-    "/{conversation_id}/messages/{message_id}",
-    response_model=MessageResponse,
-    summary="Update a message",
-)
-async def update_message(
-    conversation_id: str,
-    message_id: str,
-    body: MessageUpdate,
-    current_user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> MessageResponse:
-    await _assert_conversation_owned(conversation_id, current_user, db)
-    message = await _get_message(message_id, conversation_id, db)
-    message.content = body.content
-    await db.commit()
-    await db.refresh(message)
-    return MessageResponse.model_validate(message)
-
-
-# ---------------------------------------------------------------------------
-# DELETE /conversations/{conversation_id}/messages/{message_id}
-# ---------------------------------------------------------------------------
-
-
-@router.delete(
-    "/{conversation_id}/messages/{message_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    summary="Delete a message",
-)
-async def delete_message(
-    conversation_id: str,
-    message_id: str,
-    current_user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> None:
-    await _assert_conversation_owned(conversation_id, current_user, db)
-    message = await _get_message(message_id, conversation_id, db)
-    await db.delete(message)
-    await db.commit()
-
-
-# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -216,16 +148,3 @@ async def _assert_conversation_owned(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
     if conversation.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
-
-
-async def _get_message(message_id: str, conversation_id: str, db: AsyncSession) -> Message:
-    """Fetch a :class:`Message` that belongs to *conversation_id*, or raise 404."""
-    message: Message | None = await db.scalar(
-        select(Message).where(
-            Message.id == message_id,
-            Message.conversation_id == conversation_id,
-        )
-    )
-    if message is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found.")
-    return message
